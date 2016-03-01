@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"github.com/patrickmn/go-cache"
 	"runtime"
 	"time"
+	"strings"
 )
 
 // Console flags
@@ -27,11 +29,66 @@ var (
 type handler struct {
 	Target      string
 	Alternative string
+	SessionCache *cache.Cache
 }
 
 // ServeHTTP duplicates the incoming request (req) and does the request to the Target and the Alternate target discading the Alternate response
 func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	req1, req2 := DuplicateRequest(req)
+	alternativeRequest, productionRequest := DuplicateRequest(req)
+
+	cookieName := "PHPSESSID"
+	cookie, err := req.Cookie(cookieName)
+	if err != nil {
+		fmt.Printf("Failed to read cookie from request %s: %v\n", cookieName, err)
+	}
+	if cookie != nil {
+		alternativeSessionId, found := h.SessionCache.Get(cookie.Value)
+		if found {
+			fmt.Println("lookup HIT", cookie.Value, alternativeSessionId)
+	  	alternateCookie := &http.Cookie{
+			  Name:     cookie.Name,
+			  Value:    fmt.Sprintf("%s", alternativeSessionId),
+			  Path:     cookie.Path,
+			  Domain:   cookie.Domain,
+			  Expires:  cookie.Expires,
+			  MaxAge:   cookie.MaxAge,
+			  Secure:   cookie.Secure,
+			  HttpOnly: cookie.HttpOnly,
+			}
+			alternativeRequest.Header.Del("Cookie")
+	    alternativeRequest.AddCookie(alternateCookie)
+	  } else {
+			fmt.Println("lookup MISS", cookie.Value)
+		}
+	}
+
+	// Open new TCP connection to the server
+	clientTcpConn, err := net.DialTimeout("tcp", h.Target, time.Duration(time.Duration(*productionTimeout)*time.Second))
+	if err != nil {
+		fmt.Printf("Failed to connect to %s\n", h.Target)
+		return
+	}
+	clientHttpConn := httputil.NewClientConn(clientTcpConn, nil) // Start a new HTTP connection on it
+	defer clientHttpConn.Close()                                 // Close the connection to the server
+	err = clientHttpConn.Write(productionRequest)                // Pass on the request
+	if err != nil {
+		fmt.Printf("Failed to send to %s: %v\n", h.Target, err)
+		return
+	}
+	resp, err := clientHttpConn.Read(productionRequest) // Read back the reply
+	if err != nil {
+		fmt.Printf("Failed to receive from %s: %v\n", h.Target, err)
+		return
+	}
+
+	productionCookie := FindCookie(resp, cookieName)
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+	body, _ := ioutil.ReadAll(resp.Body)
+	w.Write(body)
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil && *debug {
@@ -48,19 +105,26 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		clientHttpConn := httputil.NewClientConn(clientTcpConn, nil) // Start a new HTTP connection on it
 		defer clientHttpConn.Close()                                 // Close the connection to the server
-		err = clientHttpConn.Write(req1)                             // Pass on the request
+		err = clientHttpConn.Write(alternativeRequest)                             // Pass on the request
 		if err != nil {
 			if *debug {
 				fmt.Printf("Failed to send to %s: %v\n", h.Alternative, err)
 			}
 			return
 		}
-		_, err = clientHttpConn.Read(req1) // Read back the reply
+		alternativeResponse, err := clientHttpConn.Read(alternativeRequest) // Read back the reply
 		if err != nil {
 			if *debug {
 				fmt.Printf("Failed to receive from %s: %v\n", h.Alternative, err)
 			}
 			return
+		}
+
+		if productionCookie != nil {
+			alternativeCookie := FindCookie(alternativeResponse, cookieName)
+			if alternativeCookie != nil {
+				h.SessionCache.Set(productionCookie.Value, alternativeCookie.Value, cache.DefaultExpiration)
+			}
 		}
 	}()
 	defer func() {
@@ -68,36 +132,10 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			fmt.Println("Recovered in f", r)
 		}
 	}()
-
-	// Open new TCP connection to the server
-	clientTcpConn, err := net.DialTimeout("tcp", h.Target, time.Duration(time.Duration(*productionTimeout)*time.Second))
-	if err != nil {
-		fmt.Printf("Failed to connect to %s\n", h.Target)
-		return
-	}
-	clientHttpConn := httputil.NewClientConn(clientTcpConn, nil) // Start a new HTTP connection on it
-	defer clientHttpConn.Close()                                 // Close the connection to the server
-	err = clientHttpConn.Write(req2)                             // Pass on the request
-	if err != nil {
-		fmt.Printf("Failed to send to %s: %v\n", h.Target, err)
-		return
-	}
-	resp, err := clientHttpConn.Read(req2) // Read back the reply
-	if err != nil {
-		fmt.Printf("Failed to receive from %s: %v\n", h.Target, err)
-		return
-	}
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-	body, _ := ioutil.ReadAll(resp.Body)
-	w.Write(body)
 }
 
 func main() {
 	flag.Parse()
-
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	local, err := net.Listen("tcp", *listen)
@@ -108,6 +146,7 @@ func main() {
 	h := handler{
 		Target:      *targetProduction,
 		Alternative: *altTarget,
+		SessionCache: cache.New(24*time.Hour, 60*time.Minute),  // 24h expiry, run every hour
 	}
 	http.Serve(local, h)
 }
@@ -118,19 +157,41 @@ type nopCloser struct {
 
 func (nopCloser) Close() error { return nil }
 
+func FindCookie(resp *http.Response, cookieName string) (*http.Cookie) {
+		for _, c := range resp.Cookies() {
+			if strings.EqualFold(c.Name, cookieName) {
+				return c
+			}
+		}
+		return nil
+}
+
 func DuplicateRequest(request *http.Request) (request1 *http.Request, request2 *http.Request) {
 	b1 := new(bytes.Buffer)
 	b2 := new(bytes.Buffer)
 	w := io.MultiWriter(b1, b2)
 	io.Copy(w, request.Body)
 	defer request.Body.Close()
+
+	// create separate headers because we want to modify them later
+	header1 := http.Header{}
+	header2 := http.Header{}
+	for k, v := range request.Header {
+		values1 := make([]string, len(v))
+		copy(values1, v)
+		header1[k] = values1
+		values2 := make([]string, len(v))
+		copy(values2, v)
+		header2[k] = values2
+	}
+
 	request1 = &http.Request{
 		Method:        request.Method,
 		URL:           request.URL,
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
-		Header:        request.Header,
+		Header:        header1,
 		Body:          nopCloser{b1},
 		Host:          request.Host,
 		ContentLength: request.ContentLength,
@@ -141,7 +202,7 @@ func DuplicateRequest(request *http.Request) (request1 *http.Request, request2 *
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
-		Header:        request.Header,
+		Header:        header2,
 		Body:          nopCloser{b2},
 		Host:          request.Host,
 		ContentLength: request.ContentLength,
